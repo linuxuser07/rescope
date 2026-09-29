@@ -3,7 +3,7 @@
 //! The `descope-wc` web component drives a flow by POSTing to `/v2/flow/start`
 //! then `/v2/flow/next`, rendering the `screen` returned in each FLAT response
 //! envelope. The emulator owns this one flow end-to-end: a two-screen flow
-//! (email → password → completed) that authenticates against the same password
+//! (email or username → password → completed) that authenticates against the same password
 //! machinery as `POST /v1/auth/password/signin`.
 //!
 //! The response envelope is FLAT (no `data` wrapper) and mirrors the real
@@ -467,6 +467,58 @@ mod tests {
                 .await
                 .assert_status_ok();
         }
+    }
+
+    #[tokio::test]
+    async fn sign_in_screen_accepts_a_username_as_well_as_an_email() {
+        let (server, _state) = setup().await;
+        let html = server.get("/pages/PROJ/v2-beta/signIn.html").await.text();
+
+        // Apps sign people in by username or phone as well as email; an email-only
+        // field would refuse them in the browser before the flow ever saw the input.
+        assert!(
+            !html.contains("descope-email-field"),
+            "the sign-in field must not be an email-only field"
+        );
+        assert!(
+            !html.contains("pattern="),
+            "the sign-in field must not restrict its input to an email shape"
+        );
+        // The server reads the identifier from the `email` input, among others.
+        assert!(html.contains(r#"name="email""#));
+    }
+
+    #[tokio::test]
+    async fn username_signs_in_through_the_flow() {
+        let (server, _state) = setup().await;
+        let login_id = "flowusername";
+        let password = "SuperSecret123!";
+        server
+            .post("/v1/auth/password/signup")
+            .json(&json!({ "loginId": login_id, "password": password, "user": {} }))
+            .await
+            .assert_status_ok();
+
+        let start = server
+            .post("/v2/flow/start")
+            .json(&json!({ "flowId": "sign-up-or-in-passwords" }))
+            .await;
+        let execution_id = start.json::<serde_json::Value>()["executionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        server
+            .post("/v2/flow/next")
+            .json(&json!({ "executionId": execution_id, "input": { "email": login_id } }))
+            .await
+            .assert_status_ok();
+        let done = server
+            .post("/v2/flow/next")
+            .json(&json!({ "executionId": execution_id, "input": { "password": password } }))
+            .await;
+
+        assert_eq!(done.json::<serde_json::Value>()["status"], "completed");
     }
 
     #[tokio::test]
