@@ -21,7 +21,7 @@ const SIGN_IN_PASSWORD_HTML: &str = include_str!("../../assets/flow/signInPasswo
 ///
 /// * `.../config.json`          → config.json (application/json)
 /// * `.../signInPassword.html`  → password screen (text/html)
-/// * `.../signIn.html`          → email screen (text/html)
+/// * `.../signIn.html`          → sign-in screen: email or username (text/html)
 ///
 /// Anything else → 404.
 pub async fn serve(uri: Uri) -> Response<Body> {
