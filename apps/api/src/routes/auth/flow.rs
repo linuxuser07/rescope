@@ -178,8 +178,35 @@ pub async fn start(
         flows.insert(exec);
     }
 
+    // config.json advertises startScreenId, so the widget renders the sign-in
+    // screen itself and sends its first submit here, as an interactionId plus
+    // the typed input. That is the sign-in screen's submit, as in Descope.
+    let submitted_first_screen = field(&body, "interactionId").is_some_and(|id| !id.is_empty());
+    if submitted_first_screen {
+        let input = body.get("input").cloned().unwrap_or_else(|| json!({}));
+        let env = submit_sign_in_screen(&state, &execution_id, &input).await;
+        return Ok((HeaderMap::new(), Json(env)));
+    }
+
     let env = waiting_envelope(&execution_id, "1", SCREEN_SIGNIN, "Welcome");
     Ok((HeaderMap::new(), Json(env)))
+}
+
+/// Sign-in screen submitted: remember the login id and show the password screen.
+async fn submit_sign_in_screen(state: &EmulatorState, execution_id: &str, input: &Value) -> Value {
+    let login_id = field(input, "externalId")
+        .or_else(|| field(input, "email"))
+        .or_else(|| field(input, "loginId"))
+        .or_else(|| first_string(input))
+        .unwrap_or_default();
+
+    state
+        .flows
+        .write()
+        .await
+        .advance_to_password(execution_id, login_id);
+
+    waiting_envelope(execution_id, "2", SCREEN_PASSWORD, "Sign In")
 }
 
 // ─── /v{1,2}/flow/next ──────────────────────────────────────────────────────
@@ -211,20 +238,7 @@ pub async fn next(
     };
 
     if step == 1 {
-        // Email screen submitted → advance to the password screen.
-        let login_id = field(&input, "externalId")
-            .or_else(|| field(&input, "email"))
-            .or_else(|| field(&input, "loginId"))
-            .or_else(|| first_string(&input))
-            .unwrap_or_default();
-
-        state
-            .flows
-            .write()
-            .await
-            .advance_to_password(&execution_id, login_id);
-
-        let env = waiting_envelope(&execution_id, "2", SCREEN_PASSWORD, "Sign In");
+        let env = submit_sign_in_screen(&state, &execution_id, &input).await;
         return Ok((HeaderMap::new(), Json(env)));
     }
 
@@ -519,6 +533,58 @@ mod tests {
             .await;
 
         assert_eq!(done.json::<serde_json::Value>()["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn start_with_the_first_screen_submitted_moves_to_the_password_screen() {
+        // config.json advertises startScreenId, so descope-wc renders the sign-in
+        // screen itself and sends the first submit with /flow/start: an
+        // interactionId plus the typed input. Descope treats that as the sign-in
+        // screen's submit; re-showing the sign-in screen would drop the input.
+        let (server, _state) = setup().await;
+        let login_id = "startsubmit@test.com";
+        let password = "SuperSecret123!";
+        server
+            .post("/v1/auth/password/signup")
+            .json(&json!({ "loginId": login_id, "password": password, "user": { "email": login_id } }))
+            .await
+            .assert_status_ok();
+
+        let start = server
+            .post("/v2/flow/start")
+            .json(&json!({
+                "flowId": "sign-up-or-in-passwords",
+                "interactionId": "Ppb_65tyyn",
+                "input": { "email": login_id }
+            }))
+            .await;
+        start.assert_status_ok();
+        let start_body = start.json::<serde_json::Value>();
+        assert_eq!(start_body["status"], "waiting");
+        assert_eq!(start_body["screen"]["id"], "signInPassword");
+
+        let execution_id = start_body["executionId"].as_str().unwrap().to_string();
+        let done = server
+            .post("/v2/flow/next")
+            .json(&json!({ "executionId": execution_id, "input": { "password": password } }))
+            .await;
+        assert_eq!(done.json::<serde_json::Value>()["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn start_without_an_interaction_shows_the_sign_in_screen_even_with_prefilled_input() {
+        // A plain start carries the host's form values (a remembered email) but
+        // no interaction; nothing was submitted, so the sign-in screen shows.
+        let (server, _state) = setup().await;
+        let start = server
+            .post("/v2/flow/start")
+            .json(&json!({
+                "flowId": "sign-up-or-in-passwords",
+                "interactionId": "",
+                "input": { "email": "remembered@test.com" }
+            }))
+            .await;
+        assert_eq!(start.json::<serde_json::Value>()["screen"]["id"], "signIn");
     }
 
     #[tokio::test]
