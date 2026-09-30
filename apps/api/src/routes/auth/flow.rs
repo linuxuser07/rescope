@@ -31,6 +31,9 @@ const FLOW_ID: &str = "sign-up-or-in-passwords";
 /// and be consistent with `config.json`'s `startScreenId` — the widget fetches
 /// the screen HTML at `{screen.id}.html`, so any id emitted here must be served.
 const SCREEN_SIGNIN: &str = "signIn";
+
+/// What the password screen says when sign-in is refused, without saying which part was wrong.
+const SIGN_IN_REFUSED: &str = "Incorrect email, username or password.";
 const SCREEN_PASSWORD: &str = "signInPassword";
 
 fn now_secs() -> u64 {
@@ -254,18 +257,12 @@ pub async fn next(
         .or_else(|| first_string(&input))
         .unwrap_or_default();
 
-    // Any auth failure re-shows the password screen (never a 500), so the widget
-    // re-renders its form; the descope-alert surfaces validation errors itself.
+    // Any auth failure re-shows the password screen (never a 500) with errorText in the
+    // screen state, which descope-wc shows in the screen's error message, as Descope does.
     let re_show = || {
-        (
-            HeaderMap::new(),
-            Json(waiting_envelope(
-                &execution_id,
-                "2",
-                SCREEN_PASSWORD,
-                "Sign In",
-            )),
-        )
+        let mut env = waiting_envelope(&execution_id, "2", SCREEN_PASSWORD, "Sign In");
+        env["screen"]["state"]["errorText"] = json!(SIGN_IN_REFUSED);
+        (HeaderMap::new(), Json(env))
     };
 
     if AuthPolicyGuard::check_method_enabled(&state, "password")
@@ -623,6 +620,47 @@ mod tests {
         assert_eq!(body["status"], "waiting");
         assert_eq!(body["screen"]["id"], "signInPassword");
         assert!(body["authInfo"].is_null());
+    }
+
+    #[tokio::test]
+    async fn wrong_password_says_why_on_the_password_screen() {
+        // descope-wc shows screen.state.errorText in the screen's error message, the way
+        // Descope reports a refused password. A silent re-show looks like nothing happened.
+        let (server, _state) = setup().await;
+        let login_id = "wrongpwmsg@test.com";
+        server
+            .post("/v1/auth/password/signup")
+            .json(&json!({
+                "loginId": login_id, "password": "Correct1!", "user": { "email": login_id }
+            }))
+            .await
+            .assert_status_ok();
+        let start = server
+            .post("/v2/flow/start")
+            .json(&json!({ "flowId": "sign-up-or-in-passwords" }))
+            .await;
+        let execution_id = start.json::<serde_json::Value>()["executionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        server
+            .post("/v2/flow/next")
+            .json(&json!({ "executionId": execution_id, "input": { "email": login_id } }))
+            .await;
+
+        let bad = server
+            .post("/v2/flow/next")
+            .json(&json!({ "executionId": execution_id, "input": { "password": "WrongOne!" } }))
+            .await;
+
+        let body = bad.json::<serde_json::Value>();
+        let error_text = body["screen"]["state"]["errorText"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !error_text.is_empty(),
+            "a refused password must carry errorText"
+        );
     }
 
     #[tokio::test]
