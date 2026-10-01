@@ -31,6 +31,9 @@ const FLOW_ID: &str = "sign-up-or-in-passwords";
 /// and be consistent with `config.json`'s `startScreenId` — the widget fetches
 /// the screen HTML at `{screen.id}.html`, so any id emitted here must be served.
 const SCREEN_SIGNIN: &str = "signIn";
+
+/// What the password screen says when sign-in is refused, without saying which part was wrong.
+const SIGN_IN_REFUSED: &str = "Incorrect email, username or password.";
 const SCREEN_PASSWORD: &str = "signInPassword";
 
 fn now_secs() -> u64 {
@@ -178,8 +181,35 @@ pub async fn start(
         flows.insert(exec);
     }
 
+    // config.json advertises startScreenId, so the widget renders the sign-in
+    // screen itself and sends its first submit here, as an interactionId plus
+    // the typed input. That is the sign-in screen's submit, as in Descope.
+    let submitted_first_screen = field(&body, "interactionId").is_some_and(|id| !id.is_empty());
+    if submitted_first_screen {
+        let input = body.get("input").cloned().unwrap_or_else(|| json!({}));
+        let env = submit_sign_in_screen(&state, &execution_id, &input).await;
+        return Ok((HeaderMap::new(), Json(env)));
+    }
+
     let env = waiting_envelope(&execution_id, "1", SCREEN_SIGNIN, "Welcome");
     Ok((HeaderMap::new(), Json(env)))
+}
+
+/// Sign-in screen submitted: remember the login id and show the password screen.
+async fn submit_sign_in_screen(state: &EmulatorState, execution_id: &str, input: &Value) -> Value {
+    let login_id = field(input, "externalId")
+        .or_else(|| field(input, "email"))
+        .or_else(|| field(input, "loginId"))
+        .or_else(|| first_string(input))
+        .unwrap_or_default();
+
+    state
+        .flows
+        .write()
+        .await
+        .advance_to_password(execution_id, login_id);
+
+    waiting_envelope(execution_id, "2", SCREEN_PASSWORD, "Sign In")
 }
 
 // ─── /v{1,2}/flow/next ──────────────────────────────────────────────────────
@@ -211,20 +241,7 @@ pub async fn next(
     };
 
     if step == 1 {
-        // Email screen submitted → advance to the password screen.
-        let login_id = field(&input, "externalId")
-            .or_else(|| field(&input, "email"))
-            .or_else(|| field(&input, "loginId"))
-            .or_else(|| first_string(&input))
-            .unwrap_or_default();
-
-        state
-            .flows
-            .write()
-            .await
-            .advance_to_password(&execution_id, login_id);
-
-        let env = waiting_envelope(&execution_id, "2", SCREEN_PASSWORD, "Sign In");
+        let env = submit_sign_in_screen(&state, &execution_id, &input).await;
         return Ok((HeaderMap::new(), Json(env)));
     }
 
@@ -240,18 +257,12 @@ pub async fn next(
         .or_else(|| first_string(&input))
         .unwrap_or_default();
 
-    // Any auth failure re-shows the password screen (never a 500), so the widget
-    // re-renders its form; the descope-alert surfaces validation errors itself.
+    // Any auth failure re-shows the password screen (never a 500) with errorText in the
+    // screen state, which descope-wc shows in the screen's error message, as Descope does.
     let re_show = || {
-        (
-            HeaderMap::new(),
-            Json(waiting_envelope(
-                &execution_id,
-                "2",
-                SCREEN_PASSWORD,
-                "Sign In",
-            )),
-        )
+        let mut env = waiting_envelope(&execution_id, "2", SCREEN_PASSWORD, "Sign In");
+        env["screen"]["state"]["errorText"] = json!(SIGN_IN_REFUSED);
+        (HeaderMap::new(), Json(env))
     };
 
     if AuthPolicyGuard::check_method_enabled(&state, "password")
@@ -522,6 +533,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_with_the_first_screen_submitted_moves_to_the_password_screen() {
+        // config.json advertises startScreenId, so descope-wc renders the sign-in
+        // screen itself and sends the first submit with /flow/start: an
+        // interactionId plus the typed input. Descope treats that as the sign-in
+        // screen's submit; re-showing the sign-in screen would drop the input.
+        let (server, _state) = setup().await;
+        let login_id = "startsubmit@test.com";
+        let password = "SuperSecret123!";
+        server
+            .post("/v1/auth/password/signup")
+            .json(&json!({ "loginId": login_id, "password": password, "user": { "email": login_id } }))
+            .await
+            .assert_status_ok();
+
+        let start = server
+            .post("/v2/flow/start")
+            .json(&json!({
+                "flowId": "sign-up-or-in-passwords",
+                "interactionId": "Ppb_65tyyn",
+                "input": { "email": login_id }
+            }))
+            .await;
+        start.assert_status_ok();
+        let start_body = start.json::<serde_json::Value>();
+        assert_eq!(start_body["status"], "waiting");
+        assert_eq!(start_body["screen"]["id"], "signInPassword");
+
+        let execution_id = start_body["executionId"].as_str().unwrap().to_string();
+        let done = server
+            .post("/v2/flow/next")
+            .json(&json!({ "executionId": execution_id, "input": { "password": password } }))
+            .await;
+        assert_eq!(done.json::<serde_json::Value>()["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn start_without_an_interaction_shows_the_sign_in_screen_even_with_prefilled_input() {
+        // A plain start carries the host's form values (a remembered email) but
+        // no interaction; nothing was submitted, so the sign-in screen shows.
+        let (server, _state) = setup().await;
+        let start = server
+            .post("/v2/flow/start")
+            .json(&json!({
+                "flowId": "sign-up-or-in-passwords",
+                "interactionId": "",
+                "input": { "email": "remembered@test.com" }
+            }))
+            .await;
+        assert_eq!(start.json::<serde_json::Value>()["screen"]["id"], "signIn");
+    }
+
+    #[tokio::test]
     async fn wrong_password_reshows_without_500() {
         let (server, _state) = setup().await;
         let login_id = "wrongpw@test.com";
@@ -557,6 +620,47 @@ mod tests {
         assert_eq!(body["status"], "waiting");
         assert_eq!(body["screen"]["id"], "signInPassword");
         assert!(body["authInfo"].is_null());
+    }
+
+    #[tokio::test]
+    async fn wrong_password_says_why_on_the_password_screen() {
+        // descope-wc shows screen.state.errorText in the screen's error message, the way
+        // Descope reports a refused password. A silent re-show looks like nothing happened.
+        let (server, _state) = setup().await;
+        let login_id = "wrongpwmsg@test.com";
+        server
+            .post("/v1/auth/password/signup")
+            .json(&json!({
+                "loginId": login_id, "password": "Correct1!", "user": { "email": login_id }
+            }))
+            .await
+            .assert_status_ok();
+        let start = server
+            .post("/v2/flow/start")
+            .json(&json!({ "flowId": "sign-up-or-in-passwords" }))
+            .await;
+        let execution_id = start.json::<serde_json::Value>()["executionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        server
+            .post("/v2/flow/next")
+            .json(&json!({ "executionId": execution_id, "input": { "email": login_id } }))
+            .await;
+
+        let bad = server
+            .post("/v2/flow/next")
+            .json(&json!({ "executionId": execution_id, "input": { "password": "WrongOne!" } }))
+            .await;
+
+        let body = bad.json::<serde_json::Value>();
+        let error_text = body["screen"]["state"]["errorText"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !error_text.is_empty(),
+            "a refused password must carry errorText"
+        );
     }
 
     #[tokio::test]
