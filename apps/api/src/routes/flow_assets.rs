@@ -132,6 +132,34 @@ mod tests {
         file
     }
 
+    #[tokio::test]
+    async fn sign_in_screen_labels_the_field_above_it_with_a_full_width_continue() {
+        let server = server_with_theme(None).await;
+
+        let html = server.get("/pages/PROJ/v2-beta/signIn.html").await.text();
+
+        assert!(html.contains(r#"label="Email or Username""#));
+        assert!(html.contains(r#"label-type="static""#));
+        assert!(html.contains(r#"full-width="true" id="Ppb_65tyyn""#));
+        assert_eq!(html.matches("<descope-button").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn password_screen_titles_the_step_and_signs_in_with_a_full_width_button() {
+        let server = server_with_theme(None).await;
+
+        let html = server
+            .get("/pages/PROJ/v2-beta/signInPassword.html")
+            .await
+            .text();
+
+        assert!(html.contains(r#"variant="h3">Enter your password</descope-text>"#));
+        assert!(html.contains(r#"label="Password""#));
+        assert!(html.contains(r#"full-width="true" id="Ppb_65tyyp""#));
+        assert!(html.contains(">Sign in</descope-button>"));
+        assert_eq!(html.matches("<descope-button").count(), 1);
+    }
+
     const COMPILED_THEME: &str = r#"{"light":{"globals":"[data-theme=light]{--descope-colors-primary-main:#131340}","components":{}},"dark":{"globals":"","components":{}}}"#;
 
     #[tokio::test]
