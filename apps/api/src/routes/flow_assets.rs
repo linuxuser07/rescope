@@ -160,6 +160,29 @@ mod tests {
         assert_eq!(html.matches("<descope-button").count(), 1);
     }
 
+    #[tokio::test]
+    async fn sign_in_screens_will_not_submit_an_empty_field() {
+        let server = server_with_theme(None).await;
+
+        for (screen, field) in [("signIn", "email"), ("signInPassword", "password")] {
+            let html = server
+                .get(&format!("/pages/PROJ/v2-beta/{screen}.html"))
+                .await
+                .text();
+            let input = html
+                .split("<descope-text-field")
+                .nth(1)
+                .and_then(|rest| rest.split('>').next())
+                .unwrap();
+
+            assert!(input.contains(&format!(r#"name="{field}""#)));
+            assert!(
+                input.contains(r#"required="true""#),
+                "{screen} lets an empty {field} through"
+            );
+        }
+    }
+
     const COMPILED_THEME: &str = r#"{"light":{"globals":"[data-theme=light]{--descope-colors-primary-main:#131340}","components":{}},"dark":{"globals":"","components":{}}}"#;
 
     #[tokio::test]
